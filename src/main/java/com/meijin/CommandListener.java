@@ -388,4 +388,216 @@ public class CommandListener extends ListenerAdapter {
             case "vider" -> {
                 profile.put("reactions", new JSONArray());
                 ConfigManager.saveRoot(root);
-                replyV2(event, "🗑️ Toutes les réactions d
+                replyV2(event, "🗑️ Toutes les réactions de **" + nom + "** ont été supprimées.");
+            }
+            case "lister" -> {
+                if (reactions.isEmpty()) {
+                    replyV2(event, "ℹ️ **" + nom + "** n'a aucune réaction configurée.");
+                    return;
+                }
+                replyV2(event, "📋 **Réactions de \"" + nom + "\" :** " + joinReactions(reactions));
+            }
+        }
+    }
+
+    private boolean containsEmoji(JSONArray reactions, String emoji) {
+        return indexOfEmoji(reactions, emoji) != -1;
+    }
+
+    private int indexOfEmoji(JSONArray reactions, String emoji) {
+        for (int i = 0; i < reactions.length(); i++) {
+            if (reactions.getString(i).equals(emoji)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private String joinReactions(JSONArray reactions) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < reactions.length(); i++) {
+            if (i > 0) sb.append(" ");
+            sb.append(reactions.getString(i));
+        }
+        return sb.toString();
+    }
+
+    private boolean isAdmin(SlashCommandInteractionEvent event) {
+        return event.getMember() != null && event.getMember().hasPermission(Permission.ADMINISTRATOR);
+    }
+
+    private boolean isValidEmoji(String value) {
+        String trimmed = value.trim();
+        return UNICODE_EMOJI_PATTERN.matcher(trimmed).matches() || CUSTOM_EMOJI_PATTERN.matcher(trimmed).matches();
+    }
+
+    // --- /post-photo : étape 1, choix du salon via un menu ---
+    private void handlePostPhoto(SlashCommandInteractionEvent event) {
+        Guild guild = event.getGuild();
+        if (guild == null) {
+            replyV2(event, "❌ Cette commande doit être utilisée sur un serveur.");
+            return;
+        }
+
+        Attachment image1 = event.getOption("image").getAsAttachment();
+        OptionMapping image2Opt = event.getOption("image2");
+        Attachment image2 = image2Opt != null ? image2Opt.getAsAttachment() : null;
+
+        if (image1.getContentType() == null || !image1.getContentType().startsWith("image/")) {
+            replyV2(event, "❌ La première image n'est pas un fichier image valide (JPG, PNG, GIF, etc.).");
+            return;
+        }
+        if (image2 != null && (image2.getContentType() == null || !image2.getContentType().startsWith("image/"))) {
+            replyV2(event, "❌ La deuxième image n'est pas un fichier image valide (JPG, PNG, GIF, etc.).");
+            return;
+        }
+
+        JSONObject profiles = ConfigManager.getProfiles(ConfigManager.loadRoot());
+        if (profiles.isEmpty()) {
+            replyV2(event, "⚠️ Aucune configuration n'existe. Un administrateur doit d'abord utiliser `/config`.");
+            return;
+        }
+
+        cleanupExpiredPending();
+
+        List<String> imageUrls = new ArrayList<>();
+        imageUrls.add(image1.getUrl());
+        if (image2 != null) {
+            imageUrls.add(image2.getUrl());
+        }
+
+        String requestId = UUID.randomUUID().toString().substring(0, 8);
+        pendingPosts.put(requestId, new PendingPost(event.getUser().getIdLong(), imageUrls, System.currentTimeMillis()));
+
+        StringSelectMenu.Builder menuBuilder = StringSelectMenu.create(SELECT_PREFIX + requestId)
+                .setPlaceholder("Choisissez le salon de publication");
+
+        int added = 0;
+        for (String name : profiles.keySet()) {
+            if (added >= 25) break;
+            JSONObject profile = profiles.getJSONObject(name);
+            Long channelId = ConfigManager.getLongOrNull(profile, "target_channel_id");
+            TextChannel channel = channelId != null ? guild.getTextChannelById(channelId) : null;
+
+            String label = channel != null ? "#" + channel.getName() : "⚠️ salon introuvable";
+            menuBuilder.addOption(label, name, "Configuration : " + name);
+            added++;
+        }
+
+        if (added == 0) {
+            pendingPosts.remove(requestId);
+            replyV2(event, "⚠️ Aucune configuration valide n'a été trouvée.");
+            return;
+        }
+
+        String prompt = image2 != null ? "Choisissez le salon où publier vos photos :" : "Choisissez le salon où publier votre photo :";
+        replyV2WithMenu(event, prompt, menuBuilder.build());
+    }
+
+    // --- /post-photo : étape 2, le membre choisit un salon dans le menu ---
+    @Override
+    public void onStringSelectInteraction(StringSelectInteractionEvent event) {
+        String customId = event.getComponentId();
+        if (!customId.startsWith(SELECT_PREFIX)) {
+            return;
+        }
+
+        String requestId = customId.substring(SELECT_PREFIX.length());
+        PendingPost pending = pendingPosts.remove(requestId);
+
+        if (pending == null || System.currentTimeMillis() - pending.createdAt() > PENDING_EXPIRY_MS) {
+            replyV2(event, "⚠️ Cette sélection a expiré. Relancez `/post-photo`.");
+            return;
+        }
+        if (event.getUser().getIdLong() != pending.requesterId()) {
+            replyV2(event, "❌ Seule la personne ayant lancé `/post-photo` peut faire ce choix.");
+            return;
+        }
+
+        Guild guild = event.getGuild();
+        String profileName = event.getValues().get(0);
+        JSONObject profiles = ConfigManager.getProfiles(ConfigManager.loadRoot());
+
+        if (guild == null || !profiles.has(profileName)) {
+            replyV2(event, "⚠️ Cette configuration n'existe plus.");
+            return;
+        }
+
+        JSONObject profile = profiles.getJSONObject(profileName);
+        Long channelId = ConfigManager.getLongOrNull(profile, "target_channel_id");
+        TextChannel targetChannel = channelId != null ? guild.getTextChannelById(channelId) : null;
+
+        if (targetChannel == null) {
+            replyV2(event, "⚠️ Le salon configuré pour **" + profileName + "** est introuvable ou a été supprimé.");
+            return;
+        }
+
+        // On accuse réception tout de suite ; le message éphémère sera mis à jour une fois la publication terminée.
+        event.deferEdit().queue();
+
+        String bodyText = profile.getString("text_template").replace("{user}", "<@" + pending.requesterId() + ">");
+        Color accentColor = parseHexColorOrDefault(profile.getString("color"));
+
+        List<MediaGalleryItem> galleryItems = new ArrayList<>();
+        for (String url : pending.imageUrls()) {
+            galleryItems.add(MediaGalleryItem.fromUrl(url));
+        }
+
+        Container container = Container.of(
+                TextDisplay.of("# " + profile.getString("title")),
+                TextDisplay.of(bodyText),
+                MediaGallery.of(galleryItems)
+        ).withAccentColor(accentColor.getRGB());
+
+        Long roleId = ConfigManager.getLongOrNull(profile, "ping_role_id");
+        String pingContent = roleId != null ? "<@&" + roleId + ">" : null;
+
+        MessageCreateAction messageAction = targetChannel.sendMessageComponents(container).useComponentsV2();
+        if (pingContent != null) {
+            messageAction = messageAction.setContent(pingContent);
+        }
+
+        messageAction.queue(
+                posted -> {
+                    addReactions(posted, profile);
+                    event.getHook().editOriginalComponents(TextDisplay.of("✅ Publié dans " + targetChannel.getAsMention() + " !"))
+                            .useComponentsV2().queue();
+                },
+                error -> event.getHook().editOriginalComponents(TextDisplay.of("❌ Erreur lors de la publication : " + error.getMessage()))
+                        .useComponentsV2().queue()
+        );
+    }
+
+    private void cleanupExpiredPending() {
+        Iterator<Map.Entry<String, PendingPost>> it = pendingPosts.entrySet().iterator();
+        long now = System.currentTimeMillis();
+        while (it.hasNext()) {
+            if (now - it.next().getValue().createdAt() > PENDING_EXPIRY_MS) {
+                it.remove();
+            }
+        }
+    }
+
+    // Ajout des réactions automatiques (liste configurée via /config-reactions — standards ou custom du serveur)
+    private void addReactions(Message posted, JSONObject profile) {
+        if (!profile.has("reactions")) {
+            return;
+        }
+        JSONArray reactions = profile.getJSONArray("reactions");
+        for (int i = 0; i < reactions.length(); i++) {
+            String emoji = reactions.getString(i);
+            posted.addReaction(Emoji.fromFormatted(emoji)).queue(
+                    success -> {},
+                    error -> System.out.println("⚠️ Erreur lors de l'ajout de la réaction " + emoji + " : " + error.getMessage())
+            );
+        }
+    }
+
+    private Color parseHexColorOrDefault(String hex) {
+        try {
+            return new Color(Integer.parseInt(hex, 16));
+        } catch (Exception e) {
+            return new Color(0x2f3136);
+        }
+    }
+}
